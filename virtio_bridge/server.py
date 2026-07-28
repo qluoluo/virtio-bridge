@@ -103,7 +103,7 @@ class BridgeServer:
         self.bridge.init()
 
         # Clean up stale files from previous runs
-        removed = self.bridge.cleanup_stale(max_age=300)
+        removed = self.bridge.cleanup_stale(max_age=86400)
         if removed:
             logger.info(f"Cleaned up {removed} stale files")
 

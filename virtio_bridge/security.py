@@ -44,6 +44,8 @@ def is_host_allowed(host: str, allow_hosts: frozenset[str]) -> bool:
     Returns:
         True if allowed, False if blocked
     """
+    if "*" in allow_hosts:
+        return True
     return host.strip().lower() in allow_hosts
 
 

@@ -95,10 +95,18 @@ class TcpRelayServer:
 
     def _start_polling(self) -> None:
         """Poll for new connection requests."""
+        cleanup_interval = 1200  # ~every 60s (1200 × 50ms)
+        iteration = 0
         while self._running:
             pending = self.tcp_bridge.list_pending_connections()
             for conn_id in pending:
                 self._handle_connection(conn_id)
+            # Periodic cleanup of stale connection directories
+            iteration += 1
+            if iteration % cleanup_interval == 0:
+                removed = self.tcp_bridge.cleanup_stale(max_age=86400)
+                if removed:
+                    logger.info(f"Periodic cleanup: removed {removed} stale connections")
             time.sleep(0.05)  # 50ms poll interval
 
     def _handle_connection(self, conn_id: str) -> None:
@@ -148,7 +156,7 @@ class TcpRelayServer:
         """Start the relay server using polling. Blocks until stopped."""
         self.tcp_bridge.init()
 
-        removed = self.tcp_bridge.cleanup_stale(max_age=300)
+        removed = self.tcp_bridge.cleanup_stale(max_age=86400)
         if removed:
             logger.info(f"Cleaned up {removed} stale connections")
 
