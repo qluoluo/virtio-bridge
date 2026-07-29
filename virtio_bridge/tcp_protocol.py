@@ -194,10 +194,10 @@ class TcpConnection:
 
     def _write_stream(self, path: Path, data: bytes) -> None:
         """Write data to a stream file, encrypting if crypto is enabled.
-        Retries up to 3 times on transient filesystem errors."""
+        Retries up to 5 times on transient filesystem errors."""
         import time as _time
         last_err = None
-        for attempt in range(3):
+        for attempt in range(5):
             pos_before = 0
             try:
                 pos_before = path.stat().st_size if path.exists() else 0
@@ -221,8 +221,8 @@ class TcpConnection:
                     os.truncate(path, pos_before)
                 except OSError:
                     pass
-                if attempt < 2:
-                    _time.sleep(0.05 * (attempt + 1))  # 50ms, 100ms backoff
+                if attempt < 4:
+                    _time.sleep(0.1 * (2 ** attempt))  # 100ms, 200ms, 400ms, 800ms backoff
         raise last_err
 
     def read_upstream(self) -> bytes:

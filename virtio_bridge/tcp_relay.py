@@ -39,7 +39,7 @@ class TcpRelayHandler:
         # Thread: read from upstream file → write to target socket
         def upstream_pump():
             try:
-                for chunk in self.conn.iter_upstream(timeout=300):
+                for chunk in self.conn.iter_upstream(timeout=3600):
                     if stop_event.is_set():
                         break
                     try:
@@ -80,8 +80,8 @@ class TcpRelayHandler:
         up_thread.start()
         down_thread.start()
 
-        up_thread.join(timeout=600)
-        down_thread.join(timeout=600)
+        up_thread.join(timeout=3600)
+        down_thread.join(timeout=3600)
 
         self.target.close()
         logger.info(f"Relay finished: {self.dest or '?'}  [{self.cid or conn_id[:4]}]")
@@ -98,6 +98,8 @@ class TcpRelayServer:
         self.allow_hosts = allow_hosts or LOCAL_HOSTS
         self._running = False
         self._active_conns: set[str] = set()
+        self._host_last_connect: dict[str, float] = {}  # rate limiter per host
+        self._host_connect_interval = 0.5  # min 500ms between connects to same host
 
     def stop(self) -> None:
         self._running = False
@@ -123,7 +125,7 @@ class TcpRelayServer:
             # Periodic cleanup of stale connection directories
             iteration += 1
             if iteration % cleanup_interval == 0:
-                removed = self.tcp_bridge.cleanup_stale(max_age=300)
+                removed = self.tcp_bridge.cleanup_stale(max_age=3600)
                 if removed:
                     logger.info(f"Periodic cleanup: removed {removed} stale connections")
             time.sleep(0.05)  # 50ms poll interval
@@ -163,6 +165,14 @@ class TcpRelayServer:
                 return
 
             try:
+                # Rate limit: avoid burst connections to same host
+                now = time.time()
+                last = self._host_last_connect.get(req.host, 0)
+                wait = self._host_connect_interval - (now - last)
+                if wait > 0:
+                    time.sleep(wait)
+                self._host_last_connect[req.host] = time.time()
+
                 target_sock = socket.create_connection(
                     (req.host, req.port),
                     timeout=10,
@@ -170,14 +180,14 @@ class TcpRelayServer:
                 target_sock.settimeout(None)  # Switch to blocking after connect
                 # Disable Nagle — proxy should forward data immediately
                 target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                # TCP keepalive: probe after 15s idle, every 15s, 3 probes max
+                # TCP keepalive: align with Linux kernel defaults (7200s idle)
                 target_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 if hasattr(socket, 'TCP_KEEPIDLE'):
-                    target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+                    target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 7200)
                 if hasattr(socket, 'TCP_KEEPINTVL'):
-                    target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15)
+                    target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 75)
                 if hasattr(socket, 'TCP_KEEPCNT'):
-                    target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                    target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 9)
             except (socket.error, OSError) as e:
                 logger.error(f"✗ FAILED {dest} [{cid}]: {e}")
                 conn.signal_error(str(e))

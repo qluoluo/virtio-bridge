@@ -127,7 +127,7 @@ class SocksHandler:
         """Bidirectional data relay between SOCKS client and filesystem bridge."""
         conn = self.conn
         client = self.client
-        client.settimeout(300.0)  # 5min timeout for relay
+        client.settimeout(3600.0)  # 1h timeout for relay
 
         # Thread: read from client socket → write to upstream file
         def upstream_pump():
@@ -146,7 +146,7 @@ class SocksHandler:
         # Thread: read from downstream file → write to client socket
         def downstream_pump():
             try:
-                for chunk in conn.iter_downstream(timeout=300):
+                for chunk in conn.iter_downstream(timeout=3600):
                     try:
                         client.sendall(chunk)
                     except (socket.error, OSError):
@@ -162,7 +162,7 @@ class SocksHandler:
         up_thread.start()
         down_thread.start()
 
-        down_thread.join(timeout=600)
+        down_thread.join(timeout=3600)
         # When downstream finishes, force client shutdown to unblock upstream recv
         try:
             client.shutdown(socket.SHUT_RDWR)
@@ -242,7 +242,7 @@ class SocksServer:
         self.listen_port = listen_port
         self._server_sock: Optional[socket.socket] = None
         self._running = False
-        self._semaphore = threading.Semaphore(64)
+        self._semaphore = threading.Semaphore(512)
 
     def start(self) -> None:
         """Start the SOCKS5 server. Blocks until stopped."""
@@ -252,7 +252,7 @@ class SocksServer:
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_sock.settimeout(1.0)
         self._server_sock.bind((self.listen_host, self.listen_port))
-        self._server_sock.listen(32)
+        self._server_sock.listen(128)
         self._running = True
 
         if self.listen_host in ("0.0.0.0", "::"):
@@ -264,6 +264,22 @@ class SocksServer:
         logger.info(f"SOCKS5 proxy started: {self.listen_host}:{self.listen_port}")
         logger.info(f"Bridge directory: {self.tcp_bridge.root}")
 
+        # Background thread: periodic cleanup of stale bridge connections
+        def cleanup_loop():
+            while self._running:
+                time.sleep(120)
+                if not self._running:
+                    break
+                try:
+                    removed = self.tcp_bridge.cleanup_stale(max_age=300)
+                    if removed:
+                        logger.info(f"Periodic cleanup: removed {removed} stale connections")
+                except Exception:
+                    pass
+
+        cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True)
+        cleanup_thread.start()
+
         try:
             while self._running:
                 try:
@@ -273,7 +289,7 @@ class SocksServer:
                 except OSError:
                     break
 
-                client_sock.settimeout(30.0)  # 30s timeout for handshake
+                client_sock.settimeout(120.0)  # 2min timeout for handshake
                 if not self._semaphore.acquire(blocking=False):
                     logger.warning(f"Dropping connection from {addr}: too many connections")
                     client_sock.close()

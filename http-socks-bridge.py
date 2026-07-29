@@ -17,7 +17,7 @@ LISTEN_PORT = 8080
 
 def socks5_connect(host, port):
     """Establish a TCP connection through SOCKS5 proxy."""
-    sock = socket.create_connection((SOCKS_HOST, SOCKS_PORT), timeout=30)
+    sock = socket.create_connection((SOCKS_HOST, SOCKS_PORT), timeout=120)
     
     # SOCKS5 handshake
     sock.sendall(b"\x05\x01\x00")  # VER=5, NMETHODS=1, METHOD=0 (no auth)
@@ -38,26 +38,25 @@ def socks5_connect(host, port):
     return sock
 
 
-def relay(src, dst):
-    """Bidirectional relay between two sockets."""
-    sockets = [src, dst]
-    while True:
-        r, _, _ = select.select(sockets, [], [], 1)
-        for s in r:
-            try:
-                data = s.recv(8192)
-            except Exception:
-                return
+def pump(src, dst):
+    """Unidirectional pump from src to dst. Runs until EOF or error."""
+    try:
+        while True:
+            data = src.recv(8192)
             if not data:
-                return
-            if s is src:
-                dst.sendall(data)
-            else:
-                src.sendall(data)
+                break
+            dst.sendall(data)
+    except Exception:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
 
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
-    timeout = 60
+    timeout = 3600
 
     def do_GET(self):
         self._handle("GET")
@@ -85,11 +84,27 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             remote = socks5_connect(host, port)
             self.send_response(200, "Connection Established")
             self.end_headers()
-            
-            relay_thread = threading.Thread(target=relay, args=(self.connection, remote))
-            relay_thread.daemon = True
-            relay_thread.start()
-            relay(remote, self.connection)
+
+            # Two dedicated pump threads (no select-on-same-socket race)
+            up_thread = threading.Thread(
+                target=pump, args=(self.connection, remote), daemon=True
+            )
+            down_thread = threading.Thread(
+                target=pump, args=(remote, self.connection), daemon=True
+            )
+            up_thread.start()
+            down_thread.start()
+            down_thread.join(timeout=3600)
+            # Force cleanup when downstream finishes
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                remote.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            up_thread.join(timeout=60)
         except Exception as e:
             self.send_error(502, f"Connection failed: {e}")
 
@@ -117,7 +132,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     headers[k] = v
             
             req = urllib.request.Request(url, data=body, headers=headers, method=method)
-            resp = urllib.request.urlopen(req, timeout=30)
+            resp = urllib.request.urlopen(req, timeout=60)
             
             self.send_response(resp.status)
             for k, v in resp.headers.items():
@@ -149,6 +164,7 @@ def main():
     class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         allow_reuse_address = True
         daemon_threads = True
+        request_queue_size = 128
     
     with ThreadedServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler) as httpd:
         httpd.serve_forever()
