@@ -9,7 +9,6 @@ data bidirectionally through the filesystem.
 import logging
 import signal
 import socket
-import select
 import sys
 import threading
 import time
@@ -25,12 +24,11 @@ logger = logging.getLogger("virtio-bridge.tcp-relay")
 class TcpRelayHandler:
     """Handles a single TCP connection relay."""
 
-    def __init__(self, conn: TcpConnection, target_sock: socket.socket, dest: str = "", cid: str = "", early_data: bytes = b""):
+    def __init__(self, conn: TcpConnection, target_sock: socket.socket, dest: str = "", cid: str = ""):
         self.conn = conn
         self.target = target_sock
         self.dest = dest
         self.cid = cid
-        self.early_data = early_data
 
     def relay(self) -> None:
         """Run bidirectional relay. Blocks until connection closes."""
@@ -38,19 +36,16 @@ class TcpRelayHandler:
         label = f"{self.dest or '?'} [{self.cid or conn_id[:4]}]"
         stop_event = threading.Event()
 
-        # Forward any early data captured during pre-establish probe
-        if self.early_data:
-            try:
-                self.conn.write_downstream(self.early_data)
-            except Exception:
-                pass
-
         # Thread: read from upstream file → write to target socket
         def upstream_pump():
+            first_chunk = True
             try:
                 for chunk in self.conn.iter_upstream(timeout=300):
                     if stop_event.is_set():
                         break
+                    if first_chunk:
+                        logger.info(f"↖ {label} first send: {chunk[:20].hex()} ({len(chunk)} bytes)")
+                        first_chunk = False
                     try:
                         self.target.sendall(chunk)
                     except (socket.error, OSError) as e:
@@ -187,33 +182,6 @@ class TcpRelayServer:
                     target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15)
                 if hasattr(socket, 'TCP_KEEPCNT'):
                     target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
-
-                # Probe: wait briefly to see if target rejects immediately.
-                # If target sends RST/FIN within 100ms, signal error instead
-                # of established — SOCKS rejects CONNECT, agent retries without
-                # losing data. If target sends early data, buffer it for relay.
-                ready, _, _ = select.select([target_sock], [], [], 0.1)
-                if ready:
-                    try:
-                        target_sock.setblocking(False)
-                        peek = target_sock.recv(1)
-                        target_sock.setblocking(True)
-                    except BlockingIOError:
-                        peek = None  # rare race, treat as alive
-                    except (socket.error, OSError) as e:
-                        logger.debug(f"Target reset during probe [{cid}]: {e}")
-                        conn.signal_error(f"Target connection reset: {e}")
-                        target_sock.close()
-                        return
-                    else:
-                        if peek == b"":
-                            # EOF — target sent FIN immediately (e.g., rate-limit reject)
-                            logger.debug(f"Target closed immediately [{cid}]")
-                            conn.signal_error("Target closed connection immediately")
-                            target_sock.close()
-                            return
-                        # Got early data (unusual for HTTPS, but buffer it)
-                        self._early_data = peek
             except (socket.error, OSError) as e:
                 logger.error(f"✗ FAILED {dest} [{cid}]: {e}")
                 conn.signal_error(str(e))
@@ -223,10 +191,7 @@ class TcpRelayServer:
             elapsed = time.time() - start_time
             logger.info(f"✓ ESTABLISHED {dest} [{cid}] ({elapsed:.0f}s)")
 
-            early = getattr(self, '_early_data', b'')
-            if hasattr(self, '_early_data'):
-                del self._early_data
-            handler = TcpRelayHandler(conn, target_sock, dest, cid, early_data=early)
+            handler = TcpRelayHandler(conn, target_sock, dest, cid)
             handler.relay()
 
             elapsed = time.time() - start_time

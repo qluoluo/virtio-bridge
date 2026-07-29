@@ -3,8 +3,13 @@
 
 SESSION="virtio-relay"
 
-# === 修改为你的共享文件系统路径 ===
-BRIDGE_DIR="/path/to/shared/.bridge"
+# 从配置文件读取 BRIDGE_DIR（不提交到 git）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$SCRIPT_DIR/bridge-dir.conf" ]; then
+  source "$SCRIPT_DIR/bridge-dir.conf"
+else
+  BRIDGE_DIR="/path/to/shared/.bridge"
+fi
 
 # 如果 tmux 会话已存在，先杀掉重建
 tmux has-session -t "$SESSION" 2>/dev/null && tmux kill-session -t "$SESSION"
