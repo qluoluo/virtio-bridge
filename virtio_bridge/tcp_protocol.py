@@ -41,7 +41,7 @@ CLOSE_DOWN_FILE = "close_down"
 
 STREAM_READ_INTERVAL = 0.005  # 5ms - aggressive for interactive use
 CONNECT_POLL_INTERVAL = 0.01  # 10ms
-CONNECT_TIMEOUT = 10.0  # seconds
+CONNECT_TIMEOUT = 15.0  # seconds — must exceed relay's connect timeout (10s)
 
 
 @dataclass
@@ -148,10 +148,14 @@ class TcpConnection:
     def signal_error(self, message: str) -> None:
         """Server side: signal connection error."""
         data = json.dumps({"error": message, "timestamp": time.time()})
-        if self.crypto:
-            self.error_path.write_bytes(self.crypto.encrypt_text(data))
-        else:
-            self.error_path.write_text(data, encoding="utf-8")
+        try:
+            if self.crypto:
+                self.error_path.write_bytes(self.crypto.encrypt_text(data))
+            else:
+                self.error_path.write_text(data, encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            # Directory already cleaned up by SOCKS side timeout
+            pass
 
     def wait_established(self, timeout: float = CONNECT_TIMEOUT) -> bool:
         """Client side: wait for connection to be established. Returns False on error/timeout."""

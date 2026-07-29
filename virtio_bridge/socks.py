@@ -112,7 +112,6 @@ class SocksHandler:
             error = self.conn.get_error() or "Connection timeout"
             logger.error(f"[{self.addr}] Connection failed: {error}")
             self._send_reply(REP_CONNECTION_REFUSED)
-            self.conn.cleanup()
             self.conn = None
             return
 
