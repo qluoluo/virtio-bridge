@@ -38,14 +38,10 @@ class TcpRelayHandler:
 
         # Thread: read from upstream file → write to target socket
         def upstream_pump():
-            first_chunk = True
             try:
                 for chunk in self.conn.iter_upstream(timeout=300):
                     if stop_event.is_set():
                         break
-                    if first_chunk:
-                        logger.info(f"↖ {label} first send: {chunk[:20].hex()} ({len(chunk)} bytes)")
-                        first_chunk = False
                     try:
                         self.target.sendall(chunk)
                     except (socket.error, OSError) as e:
