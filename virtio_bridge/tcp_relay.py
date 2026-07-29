@@ -9,6 +9,7 @@ data bidirectionally through the filesystem.
 import logging
 import signal
 import socket
+import select
 import sys
 import threading
 import time
@@ -24,20 +25,39 @@ logger = logging.getLogger("virtio-bridge.tcp-relay")
 class TcpRelayHandler:
     """Handles a single TCP connection relay."""
 
-    def __init__(self, conn: TcpConnection, target_sock: socket.socket):
+    def __init__(self, conn: TcpConnection, target_sock: socket.socket, dest: str = "", cid: str = "", early_data: bytes = b""):
         self.conn = conn
         self.target = target_sock
+        self.dest = dest
+        self.cid = cid
+        self.early_data = early_data
 
     def relay(self) -> None:
         """Run bidirectional relay. Blocks until connection closes."""
+        conn_id = self.conn.conn_id
+        label = f"{self.dest or '?'} [{self.cid or conn_id[:4]}]"
+        stop_event = threading.Event()
+
+        # Forward any early data captured during pre-establish probe
+        if self.early_data:
+            try:
+                self.conn.write_downstream(self.early_data)
+            except Exception:
+                pass
+
         # Thread: read from upstream file → write to target socket
         def upstream_pump():
             try:
-                for chunk in self.conn.iter_upstream(timeout=60):
+                for chunk in self.conn.iter_upstream(timeout=300):
+                    if stop_event.is_set():
+                        break
                     try:
                         self.target.sendall(chunk)
-                    except (socket.error, OSError):
+                    except (socket.error, OSError) as e:
+                        logger.debug(f"↖ {label} upstream send error: {e}")
                         break
+            except Exception as e:
+                logger.warning(f"↖ {label} upstream pump error: {e}")
             finally:
                 try:
                     self.target.shutdown(socket.SHUT_WR)
@@ -50,11 +70,17 @@ class TcpRelayHandler:
                 while True:
                     try:
                         data = self.target.recv(8192)
-                    except (socket.error, OSError):
+                    except (socket.error, OSError) as e:
+                        logger.debug(f"↘ {label} downstream recv error: {e}")
+                        stop_event.set()
                         break
                     if not data:
+                        logger.debug(f"↘ {label} target closed (EOF)")
+                        stop_event.set()
                         break
                     self.conn.write_downstream(data)
+            except Exception as e:
+                logger.warning(f"↘ {label} downstream pump error: {e}")
             finally:
                 self.conn.close_downstream()
 
@@ -63,11 +89,11 @@ class TcpRelayHandler:
         up_thread.start()
         down_thread.start()
 
-        up_thread.join(timeout=120)
-        down_thread.join(timeout=120)
+        up_thread.join(timeout=600)
+        down_thread.join(timeout=600)
 
         self.target.close()
-        logger.info(f"Relay finished: {self.conn.conn_id}")
+        logger.info(f"Relay finished: {self.dest or '?'}  [{self.cid or conn_id[:4]}]")
 
 
 class TcpRelayServer:
@@ -100,14 +126,17 @@ class TcpRelayServer:
         while self._running:
             pending = self.tcp_bridge.list_pending_connections()
             for conn_id in pending:
-                self._handle_connection(conn_id)
+                if conn_id not in self._active_conns:
+                    self._active_conns.add(conn_id)
+                    self._handle_connection(conn_id)
             # Periodic cleanup of stale connection directories
             iteration += 1
             if iteration % cleanup_interval == 0:
-                removed = self.tcp_bridge.cleanup_stale(max_age=86400)
+                removed = self.tcp_bridge.cleanup_stale(max_age=300)
                 if removed:
                     logger.info(f"Periodic cleanup: removed {removed} stale connections")
             time.sleep(0.05)  # 50ms poll interval
+        logger.info("Polling loop exited, relay stopped")
 
     def _handle_connection(self, conn_id: str) -> None:
         """Handle a new connection request in a thread."""
@@ -121,42 +150,97 @@ class TcpRelayServer:
     def _do_handle_connection(self, conn_id: str) -> None:
         """Establish real TCP connection and start relay."""
         conn = self.tcp_bridge.new_connection(conn_id)
-        req = conn.read_connect_request()
-        if req is None:
-            logger.warning(f"Connect request disappeared: {conn_id}")
-            return
-
-        logger.info(f"→ TCP CONNECT {req.host}:{req.port} (conn={conn_id})")
-
-        # Check host against allow list
-        if not is_host_allowed(req.host, self.allow_hosts):
-            msg = f"Host '{req.host}' is not in the allow list: {sorted(self.allow_hosts)}"
-            logger.warning(f"← {conn_id} BLOCKED: {msg}")
-            conn.signal_error(msg)
-            return
-
         try:
-            target_sock = socket.create_connection(
-                (req.host, req.port),
-                timeout=10,
-            )
-            target_sock.settimeout(None)  # Switch to blocking after connect
-        except (socket.error, OSError) as e:
-            logger.error(f"← {conn_id} Connection failed: {e}")
-            conn.signal_error(str(e))
-            return
+            req = conn.read_connect_request()
+            if req is None:
+                logger.warning(f"Connect request disappeared: {conn_id}")
+                self._active_conns.discard(conn_id)
+                return
 
-        conn.signal_established()
-        logger.info(f"← {conn_id} Connected to {req.host}:{req.port}")
+            cid = conn_id[:4]
+            scheme = {443: "HTTPS", 80: "HTTP", 22: "SSH", 5432: "PG"}.get(req.port, f":{req.port}")
+            dest = f"{req.host}:{req.port}" if scheme.startswith(":") else f"{req.host} ({scheme})"
+            start_time = time.time()
 
-        handler = TcpRelayHandler(conn, target_sock)
-        handler.relay()
+            logger.info(f"→ CONNECT {dest} [{cid}]")
+
+            # Check host against allow list
+            if not is_host_allowed(req.host, self.allow_hosts):
+                msg = f"Host '{req.host}' is not in the allow list: {sorted(self.allow_hosts)}"
+                logger.warning(f"✗ BLOCKED {dest} [{cid}]: {msg}")
+                conn.signal_error(msg)
+                return
+
+            try:
+                target_sock = socket.create_connection(
+                    (req.host, req.port),
+                    timeout=10,
+                )
+                target_sock.settimeout(None)  # Switch to blocking after connect
+                # Disable Nagle — proxy should forward data immediately
+                target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # TCP keepalive: probe after 15s idle, every 15s, 3 probes max
+                target_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                if hasattr(socket, 'TCP_KEEPIDLE'):
+                    target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+                if hasattr(socket, 'TCP_KEEPINTVL'):
+                    target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15)
+                if hasattr(socket, 'TCP_KEEPCNT'):
+                    target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+
+                # Probe: wait briefly to see if target rejects immediately.
+                # If target sends RST/FIN within 100ms, signal error instead
+                # of established — SOCKS rejects CONNECT, agent retries without
+                # losing data. If target sends early data, buffer it for relay.
+                ready, _, _ = select.select([target_sock], [], [], 0.1)
+                if ready:
+                    try:
+                        target_sock.setblocking(False)
+                        peek = target_sock.recv(1)
+                        target_sock.setblocking(True)
+                    except BlockingIOError:
+                        peek = None  # rare race, treat as alive
+                    except (socket.error, OSError) as e:
+                        logger.debug(f"Target reset during probe [{cid}]: {e}")
+                        conn.signal_error(f"Target connection reset: {e}")
+                        target_sock.close()
+                        return
+                    else:
+                        if peek == b"":
+                            # EOF — target sent FIN immediately (e.g., rate-limit reject)
+                            logger.debug(f"Target closed immediately [{cid}]")
+                            conn.signal_error("Target closed connection immediately")
+                            target_sock.close()
+                            return
+                        # Got early data (unusual for HTTPS, but buffer it)
+                        self._early_data = peek
+            except (socket.error, OSError) as e:
+                logger.error(f"✗ FAILED {dest} [{cid}]: {e}")
+                conn.signal_error(str(e))
+                return
+
+            conn.signal_established()
+            elapsed = time.time() - start_time
+            logger.info(f"✓ ESTABLISHED {dest} [{cid}] ({elapsed:.0f}s)")
+
+            early = getattr(self, '_early_data', b'')
+            if hasattr(self, '_early_data'):
+                del self._early_data
+            handler = TcpRelayHandler(conn, target_sock, dest, cid, early_data=early)
+            handler.relay()
+
+            elapsed = time.time() - start_time
+            logger.info(f"← CLOSED {dest} [{cid}] ({elapsed:.0f}s)")
+        finally:
+            # Don't cleanup here — socks side may still need close_down.
+            # cleanup_stale handles actual deletion when both sides are done.
+            self._active_conns.discard(conn_id)
 
     def start(self) -> None:
         """Start the relay server using polling. Blocks until stopped."""
         self.tcp_bridge.init()
 
-        removed = self.tcp_bridge.cleanup_stale(max_age=86400)
+        removed = self.tcp_bridge.cleanup_stale(max_age=0)
         if removed:
             logger.info(f"Cleaned up {removed} stale connections")
 
@@ -179,11 +263,15 @@ def run_tcp_relay(bridge_dir: str, allow_hosts: frozenset[str] | None = None, cr
     server = TcpRelayServer(bridge_dir=bridge_dir, allow_hosts=allow_hosts, crypto=crypto)
 
     def signal_handler(sig, frame):
-        logger.info("Shutting down...")
-        server.stop()
-        sys.exit(0)
+        logger.info(f"Received signal {sig}, shutting down...")
+        server._running = False  # Causes _start_polling to exit
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    server.start()
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        logger.info("TCP relay stopped")

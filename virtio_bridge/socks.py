@@ -46,10 +46,11 @@ REP_NETWORK_UNREACHABLE = 0x03
 class SocksHandler:
     """Handles a single SOCKS5 client connection."""
 
-    def __init__(self, client_sock: socket.socket, addr: tuple, tcp_bridge: TcpBridgeDirectory):
+    def __init__(self, client_sock: socket.socket, addr: tuple, tcp_bridge: TcpBridgeDirectory, server: Optional['SocksServer'] = None):
         self.client = client_sock
         self.addr = addr
         self.tcp_bridge = tcp_bridge
+        self.server = server
         self.conn: Optional[TcpConnection] = None
 
     def handle(self) -> None:
@@ -61,6 +62,10 @@ class SocksHandler:
             self.client.close()
             if self.conn:
                 self.conn.close_upstream()
+                # Don't cleanup — relay side may still be writing close_down.
+                # cleanup_stale handles actual deletion when both sides are done.
+            if self.server:
+                self.server._semaphore.release()
 
     def _do_handshake(self) -> None:
         # Step 1: Auth negotiation
@@ -122,6 +127,7 @@ class SocksHandler:
         """Bidirectional data relay between SOCKS client and filesystem bridge."""
         conn = self.conn
         client = self.client
+        client.settimeout(300.0)  # 5min timeout for relay
 
         # Thread: read from client socket → write to upstream file
         def upstream_pump():
@@ -140,7 +146,7 @@ class SocksHandler:
         # Thread: read from downstream file → write to client socket
         def downstream_pump():
             try:
-                for chunk in conn.iter_downstream(timeout=60):
+                for chunk in conn.iter_downstream(timeout=300):
                     try:
                         client.sendall(chunk)
                     except (socket.error, OSError):
@@ -156,9 +162,13 @@ class SocksHandler:
         up_thread.start()
         down_thread.start()
 
-        # Wait for both directions to finish
-        up_thread.join(timeout=120)
-        down_thread.join(timeout=120)
+        down_thread.join(timeout=600)
+        # When downstream finishes, force client shutdown to unblock upstream recv
+        try:
+            client.shutdown(socket.SHUT_RDWR)
+        except (socket.error, OSError):
+            pass
+        up_thread.join(timeout=10)
 
         logger.info(f"[{self.addr}] Connection closed (conn={conn.conn_id})")
 
@@ -232,6 +242,7 @@ class SocksServer:
         self.listen_port = listen_port
         self._server_sock: Optional[socket.socket] = None
         self._running = False
+        self._semaphore = threading.Semaphore(64)
 
     def start(self) -> None:
         """Start the SOCKS5 server. Blocks until stopped."""
@@ -262,7 +273,13 @@ class SocksServer:
                 except OSError:
                     break
 
-                handler = SocksHandler(client_sock, addr, self.tcp_bridge)
+                client_sock.settimeout(30.0)  # 30s timeout for handshake
+                if not self._semaphore.acquire(blocking=False):
+                    logger.warning(f"Dropping connection from {addr}: too many connections")
+                    client_sock.close()
+                    continue
+
+                handler = SocksHandler(client_sock, addr, self.tcp_bridge, server=self)
                 t = threading.Thread(target=handler.handle, daemon=True)
                 t.start()
         except KeyboardInterrupt:
@@ -295,9 +312,8 @@ def run_socks(
     )
 
     def signal_handler(sig, frame):
-        logger.info("Shutting down...")
-        server.stop()
-        sys.exit(0)
+        logger.info(f"Received signal {sig}, shutting down...")
+        server._running = False
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)

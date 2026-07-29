@@ -160,12 +160,16 @@ class TcpConnection:
             if self.established_path.exists():
                 return True
             if self.error_path.exists():
+                # Capture error now to avoid TOCTOU race with cleanup
+                self._cached_error = self.get_error()
                 return False
             time.sleep(CONNECT_POLL_INTERVAL)
         return False
 
     def get_error(self) -> Optional[str]:
         """Read error message if any."""
+        if hasattr(self, '_cached_error') and self._cached_error is not None:
+            return self._cached_error
         try:
             if self.crypto:
                 text = self.crypto.decrypt_text(self.error_path.read_bytes())
@@ -189,16 +193,37 @@ class TcpConnection:
         self._write_stream(self.downstream_path, data)
 
     def _write_stream(self, path: Path, data: bytes) -> None:
-        """Write data to a stream file, encrypting if crypto is enabled."""
-        with open(path, "ab") as f:
-            if self.crypto:
-                encrypted = self.crypto.encrypt(data)
-                f.write(len(encrypted).to_bytes(4, "big"))
-                f.write(encrypted)
-            else:
-                f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
+        """Write data to a stream file, encrypting if crypto is enabled.
+        Retries up to 3 times on transient filesystem errors."""
+        import time as _time
+        last_err = None
+        for attempt in range(3):
+            pos_before = 0
+            try:
+                pos_before = path.stat().st_size if path.exists() else 0
+            except OSError:
+                pass
+            try:
+                with open(path, "ab") as f:
+                    if self.crypto:
+                        encrypted = self.crypto.encrypt(data)
+                        f.write(len(encrypted).to_bytes(4, "big"))
+                        f.write(encrypted)
+                    else:
+                        f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                return
+            except OSError as e:
+                last_err = e
+                # Truncate back to pre-write size so retry doesn't duplicate data
+                try:
+                    os.truncate(path, pos_before)
+                except OSError:
+                    pass
+                if attempt < 2:
+                    _time.sleep(0.05 * (attempt + 1))  # 50ms, 100ms backoff
+        raise last_err
 
     def read_upstream(self) -> bytes:
         """Server side: read new upstream data since last read."""
@@ -254,7 +279,7 @@ class TcpConnection:
         setattr(self, buf_attr, buf)
         return result
 
-    def iter_downstream(self, timeout: float = 30.0) -> Iterator[bytes]:
+    def iter_downstream(self, timeout: float = 300.0) -> Iterator[bytes]:
         """Client side: iterate over downstream data chunks."""
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -267,7 +292,7 @@ class TcpConnection:
             else:
                 time.sleep(STREAM_READ_INTERVAL)
 
-    def iter_upstream(self, timeout: float = 30.0) -> Iterator[bytes]:
+    def iter_upstream(self, timeout: float = 300.0) -> Iterator[bytes]:
         """Server side: iterate over upstream data chunks."""
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -352,7 +377,13 @@ class TcpBridgeDirectory:
         return sorted(pending)
 
     def cleanup_stale(self, max_age: float = 300.0) -> int:
-        """Remove connection directories older than max_age seconds."""
+        """Remove connection directories that are safe to delete.
+
+        Only cleans directories where BOTH close_up and close_down exist
+        (both sides finished) and are older than max_age, OR directories
+        older than hard_max_age regardless of close state (emergency cleanup).
+        """
+        hard_max_age = max(max_age * 4, 3600.0)  # at least 1 hour
         now = time.time()
         removed = 0
         try:
@@ -360,7 +391,14 @@ class TcpBridgeDirectory:
                 if not d.is_dir():
                     continue
                 try:
-                    if now - d.stat().st_mtime > max_age:
+                    age = now - d.stat().st_mtime
+                    closed_up = (d / CLOSE_UP_FILE).exists()
+                    closed_down = (d / CLOSE_DOWN_FILE).exists()
+                    if closed_up and closed_down and age > max_age:
+                        conn = TcpConnection(self.tcp_dir, d.name)
+                        conn.cleanup()
+                        removed += 1
+                    elif age > hard_max_age:
                         conn = TcpConnection(self.tcp_dir, d.name)
                         conn.cleanup()
                         removed += 1
